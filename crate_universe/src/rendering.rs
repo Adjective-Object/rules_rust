@@ -392,6 +392,15 @@ impl Renderer {
             }
         }
 
+        krate
+            .common_attrs
+            .data_glob
+            .extend(krate.common_attrs.compile_data_glob.clone());
+        krate.common_attrs.data = Select::merge(
+            krate.common_attrs.data.clone(),
+            krate.common_attrs.compile_data.clone(),
+        );
+
         let mut starlark = Vec::new();
 
         // Banner comment for top of the file.
@@ -1141,6 +1150,7 @@ mod test {
         assert!(build_file_content.contains("rust_library("));
         assert!(build_file_content.contains("name = \"mock_crate\""));
         assert!(build_file_content.contains("\"crate-name=mock_crate\""));
+        assert!(build_file_content.contains("data = glob("));
     }
 
     #[test]
