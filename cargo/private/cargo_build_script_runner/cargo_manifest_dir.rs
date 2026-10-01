@@ -37,6 +37,34 @@ pub fn remove_symlink(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+/// Compute the relative path from `base_dir` (a directory) to `target` (a file),
+/// assuming both are absolute and already normalized (no `.` or `..` components).
+///
+/// Bazel's remote-execution protocol requires output-directory symlink targets to
+/// be relative: an absolute target that happens to resolve inside the action's own
+/// work directory is otherwise indistinguishable, from a path-string point of view,
+/// from one that escapes it, and some remote-execution implementations reject the
+/// former outright. Writing genuinely relative symlinks sidesteps that ambiguity.
+fn relative_from(base_dir: &Path, target: &Path) -> PathBuf {
+    let base_components: Vec<_> = base_dir.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+    let common_len = base_components
+        .iter()
+        .zip(target_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result = PathBuf::new();
+    for _ in common_len..base_components.len() {
+        result.push("..");
+    }
+    for component in &target_components[common_len..] {
+        result.push(component.as_os_str());
+    }
+
+    result
+}
+
 /// Check if the system supports symlinks by attempting to create one.
 fn system_supports_symlinks(test_dir: &Path) -> Result<bool, String> {
     let test_file = test_dir.join("cbsr.txt");
@@ -181,10 +209,21 @@ impl RunfilesMaker {
                     e
                 )
             })?;
-            std::fs::read(&target).map_err(|e| {
+            // Symlinks created by `create_runfiles_dir` are relative (see
+            // `relative_from`), so resolve against the symlink's own directory
+            // rather than assuming `target` is absolute.
+            let resolved_target = if target.is_absolute() {
+                target.clone()
+            } else {
+                existing
+                    .parent()
+                    .map(|parent| parent.join(&target))
+                    .unwrap_or_else(|| target.clone())
+            };
+            std::fs::read(&resolved_target).map_err(|e| {
                 format!(
                     "Failed to read symlink target '{}' with {:?}",
-                    target.display(),
+                    resolved_target.display(),
                     e
                 )
             })?
@@ -272,8 +311,12 @@ impl RunfilesMaker {
             }
 
             let abs_src = std::env::current_dir().unwrap().join(src);
+            let link_target = match abs_dest.parent() {
+                Some(parent) => relative_from(parent, &abs_src),
+                None => abs_src.clone(),
+            };
 
-            match symlink(&abs_src, &abs_dest) {
+            match symlink(&link_target, &abs_dest) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if Self::is_mergeable_metadata(dest) {
@@ -283,7 +326,7 @@ impl RunfilesMaker {
                 Err(e) => {
                     return Err(format!(
                         "Failed to link `{} -> {}` with {:?}",
-                        abs_src.display(),
+                        link_target.display(),
                         abs_dest.display(),
                         e
                     ));
@@ -596,6 +639,72 @@ mod tests {
         .unwrap();
 
         out_dir
+    }
+
+    #[test]
+    fn relative_from_computes_relative_paths() {
+        assert_eq!(
+            relative_from(Path::new("/a/b/c"), Path::new("/a/b/d/e.txt")),
+            PathBuf::from("../d/e.txt"),
+        );
+        assert_eq!(
+            relative_from(Path::new("/a/b"), Path::new("/a/b/c.txt")),
+            PathBuf::from("c.txt"),
+        );
+        assert_eq!(
+            relative_from(Path::new("/a/b/c/d"), Path::new("/x/y.txt")),
+            PathBuf::from("../../../../x/y.txt"),
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn create_runfiles_dir_writes_relative_symlinks() {
+        let test_tmp = PathBuf::from(std::env::var("TEST_TMPDIR").unwrap());
+        let work_dir = test_tmp.join("create_runfiles_dir_writes_relative_symlinks");
+        fs::create_dir(&work_dir).unwrap();
+
+        let src_dir = work_dir.join("src");
+        fs::create_dir(&src_dir).unwrap();
+        let src_file = src_dir.join("real_file.txt");
+        fs::write(&src_file, b"hello").unwrap();
+
+        let output_dir = work_dir.join("runfiles");
+        fs::create_dir(&output_dir).unwrap();
+
+        // `RunfilesMaker::create_runfiles_dir` resolves `src` relative to the
+        // process's current directory, so make that the work dir for this test.
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&work_dir).unwrap();
+
+        let mut runfiles = BTreeMap::new();
+        runfiles.insert(
+            PathBuf::from("src/real_file.txt"),
+            "nested/link.txt".to_string(),
+        );
+        let maker = RunfilesMaker {
+            output_dir: output_dir.clone(),
+            filename_suffixes_to_retain: BTreeSet::new(),
+            runfiles,
+        };
+        let result = maker.create_runfiles_dir();
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        result.unwrap();
+
+        let link_path = output_dir.join("nested").join("link.txt");
+        assert!(link_path.is_symlink());
+
+        let target = fs::read_link(&link_path).unwrap();
+        assert!(
+            target.is_relative(),
+            "expected a relative symlink target, got {}",
+            target.display()
+        );
+
+        // The symlink must still resolve to the right content.
+        let contents = fs::read_to_string(&link_path).unwrap();
+        assert_eq!(contents, "hello");
     }
 
     #[cfg(any(target_family = "windows", target_family = "unix"))]
